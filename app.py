@@ -1,11 +1,14 @@
 import streamlit as st
 import pandas as pd
+import requests
+import json
 import json
 import os
 import uuid
 from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
+import math
 
 # =============================================================================
 # [PART 1] 시스템 설정 및 데이터 로직
@@ -22,6 +25,20 @@ PART_ORDER = ["마케팅", "콘티", "모델링", "애니메이션", "편집", "
 # 🚀 성능 개선: 페이지네이션 설정
 PROJECTS_PER_PAGE = 10
 
+# 1-2. Supabase 설정 로드
+try:
+    SUPABASE_URL = st.secrets["supabase"]["url"]
+    SUPABASE_KEY = st.secrets["supabase"]["key"]
+    HEADERS = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+except:
+    SUPABASE_URL = None
+    HEADERS = None
+
 # 1-2. 세션 상태 초기화
 if 'opened_gid' not in st.session_state:
     st.session_state.opened_gid = None
@@ -31,6 +48,16 @@ if 'temp_project_data' not in st.session_state:
     st.session_state.temp_project_data = {}
 if 'cached_year_list' not in st.session_state:
     st.session_state.cached_year_list = None
+    st.session_state.cached_cat_list = None
+    st.session_state.search_index = None
+    
+# 사이드바: 데이터 관리
+with st.sidebar:
+    if st.button("🔄 데이터 새로고침"):
+        st.session_state.cached_df = None
+        st.session_state.cached_year_list = None
+        st.session_state.cached_cat_list = None
+        st.rerun()
 if 'cached_cat_list' not in st.session_state:
     st.session_state.cached_cat_list = None
 if 'cached_project_info' not in st.session_state:
@@ -63,30 +90,138 @@ def load_config():
         "penalty_rate": 0.1, "main_color": "#E84D4D", "font_family": "Pretendard"
     }
 
-# 🚀 성능 개선: 캐싱된 데이터 로드
+# 🚀 Supabase 데이터 로드 (REST API)
 def load_data():
-    if os.path.exists(DATA_FILE):
-        current_mtime = os.path.getmtime(DATA_FILE)
-        if st.session_state.cached_df is not None and st.session_state.last_load_time == current_mtime:
-            return st.session_state.cached_df.copy()
+    if not SUPABASE_URL:
+        return pd.DataFrame()
+
+    try:
+        # workers와 projects 조인 조회
+        url = f"{SUPABASE_URL}/rest/v1/workers?select=*,projects(*)"
+        response = requests.get(url, headers=HEADERS)
         
-        df = pd.read_csv(DATA_FILE)
-        df['연도'] = df['연도'].astype(str)
-        if 'worker_id' not in df.columns:
-            df['worker_id'] = [str(uuid.uuid4()) for _ in range(len(df))]
-        
+        if response.status_code != 200:
+            st.error(f"데이터 로드 실패: {response.text}") # 디버깅을 위해 주석 해제
+            return pd.DataFrame()
+            
+        data = response.json()
+        if not data:
+            return pd.DataFrame()
+            
+        flat_data = []
+        for row in data:
+            proj = row.pop('projects')
+            if proj:
+                row['프로젝트명'] = proj.get('project_name')
+                row['연도'] = str(proj.get('year'))
+                row['월'] = proj.get('month')
+                row['난이도'] = proj.get('difficulty')
+                row['분류'] = proj.get('category')
+                row['프로젝트_수정횟수'] = proj.get('total_edits')
+                row['group_id'] = proj.get('group_id')
+                row['등록일시'] = proj.get('created_at', '')[:16].replace('T', ' ')
+            
+            row['이름'] = row.pop('name')
+            row['파트'] = row.pop('part')
+            row['기여도'] = row.pop('contribution')
+            row['점수입력'] = float(row.pop('input_score', 0))
+            row['수정횟수'] = int(row.pop('edit_count', 0))
+            row['기본점수'] = float(row.pop('base_score', 0))
+            row['감점점수'] = float(row.pop('penalty_score', 0))
+            row['최종점수'] = float(row.pop('final_score', 0))
+            row['공통수정분'] = float(row.pop('common_edit_share', 0))
+            row['제외횟수'] = float(row.pop('exclude_count', 0))
+            
+            flat_data.append(row)
+            
+        df = pd.DataFrame(flat_data)
+        if not df.empty and '연도' in df.columns:
+             df['연도'] = df['연도'].astype(str)
+             
         st.session_state.cached_df = df
-        st.session_state.last_load_time = current_mtime
+        print(f"✅ 데이터 로드 완료: {len(df)}행")
         return df
-    return pd.DataFrame()
+        
+    except Exception as e:
+        st.error(f"데이터 로드 중 오류: {e}")
+        return pd.DataFrame()
 
 def save_and_stay(df, gid=None):
-    if not df.empty:
-        df['파트'] = pd.Categorical(df['파트'], categories=PART_ORDER, ordered=True)
-        df = df.sort_values(by=['등록일시', 'group_id', '파트'], ascending=[False, True, True])
-    df.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
+    if not SUPABASE_URL:
+        st.error("Supabase 연결 설정 오류")
+        return
+
+    if df.empty:
+        return
+
+    try:
+        upsert_headers = HEADERS.copy()
+        upsert_headers["Prefer"] = "return=minimal,resolution=merge-duplicates"
+
+        # 1. Projects 데이터 준비
+        projects_df = df.drop_duplicates('group_id')
+        project_data_list = []
+        for _, row in projects_df.iterrows():
+            project_data_list.append({
+                'group_id': row['group_id'],
+                'project_name': row['프로젝트명'],
+                'year': int(row['연도']),
+                'month': int(row['월']),
+                'difficulty': row['난이도'],
+                'category': row['분류'],
+                'total_edits': int(row['프로젝트_수정횟수']),
+                'created_at': row['등록일시']
+            })
+            
+        # Projects Upsert
+        p_url = f"{SUPABASE_URL}/rest/v1/projects?on_conflict=group_id"
+        res = requests.post(p_url, headers=upsert_headers, json=project_data_list)
+        if res.status_code not in [200, 201, 204]:
+            st.error(f"프로젝트 저장 실패: {res.text}")
+            return
+            
+        # 2. Workers 데이터 준비
+        # 프로젝트 ID 조회
+        p_res = requests.get(f"{SUPABASE_URL}/rest/v1/projects?select=id,group_id", headers=HEADERS)
+        if p_res.status_code == 200:
+            p_map = {item['group_id']: item['id'] for item in p_res.json()}
+        else:
+            st.error("프로젝트 ID 조회 실패")
+            return
+        
+        workers_data_list = []
+        for _, row in df.iterrows():
+            pid = p_map.get(row['group_id'])
+            if not pid: continue
+                
+            workers_data_list.append({
+                'worker_id': row['worker_id'],
+                'project_id': pid,
+                'name': row['이름'],
+                'part': row['파트'],
+                'contribution': row['기여도'],
+                'input_score': row['점수입력'],
+                'edit_count': row['수정횟수'],
+                'base_score': row['기본점수'],
+                'penalty_score': row['감점점수'],
+                'final_score': row['최종점수'],
+                'common_edit_share': row['공통수정분'],
+                'exclude_count': row['제외횟수']
+            })
+            
+        # Workers Upsert
+        w_url = f"{SUPABASE_URL}/rest/v1/workers?on_conflict=worker_id"
+        # 데이터가 많으면 나눠서 보내야 하지만, 여기선 한 번에 시도 (Supabase request size limit 주의)
+        res = requests.post(w_url, headers=upsert_headers, json=workers_data_list)
+        if res.status_code not in [200, 201, 204]:
+            st.error(f"작업자 저장 실패: {res.text}")
+            return
+            
+    except Exception as e:
+        st.error(f"데이터 저장 중 오류: {e}")
+        return
+
     st.session_state.opened_gid = gid
-    # 🚀 캐시 무효화
     st.session_state.cached_df = None
     st.session_state.last_load_time = None
     st.session_state.cached_year_list = None
@@ -336,6 +471,9 @@ with tabs[0]:
 
 # [TAB 1] 프로젝트 관리
 with tabs[1]:
+    # 디버깅: 데이터 현황 표시
+    st.info(f"📊 로드된 데이터: {len(all_df)}행 | 연도 목록: {sorted(all_df['연도'].unique().tolist()) if not all_df.empty else '없음'}")
+    
     if not all_df.empty:
         st.subheader("📊 데이터 현황")
         
