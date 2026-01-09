@@ -1,0 +1,17 @@
+{
+    "diff_weights": {
+        "S": 2.0,
+        "A": 1.5,
+        "B": 1.0,
+        "C": 0.8,
+        "D": 0.5
+    },
+    "cont_weights": {
+        "\uc0c1": 1.5,
+        "\uc911": 1.0,
+        "\ud558": 0.5
+    },
+    "penalty_rate": 0.3,
+    "main_color": "#E84D4D",
+    "font_family": "Pretendard"
+}
